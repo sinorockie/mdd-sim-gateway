@@ -854,3 +854,93 @@ class HotplugResponsivenessTests(unittest.TestCase):
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
             self.assertEqual(len(app._input_mtimes()), 7)
+
+
+class PastedNodeFidelityTests(unittest.TestCase):
+    """A link this gateway reads differently from every other client is a silent outage.
+
+    Issue #27: nodes that v2rayN connected to failed here with a generic message, because
+    the parameters that make them work were dropped on the way in.
+    """
+
+    def test_hysteria2_link_keeps_its_obfuscation(self):
+        node = parse_share_link(
+            "hysteria2://letmein@hk.example.net:8443/?obfs=salamander"
+            "&obfs-password=obfs-pw&sni=hk.example.net#HK")
+        outbound = clash_outbound(node, "exit-hk")
+        # Without this the server discards every packet and the node looks simply dead.
+        self.assertEqual(outbound["obfs"], {"type": "salamander", "password": "obfs-pw"})
+
+    def test_hysteria2_link_keeps_a_colon_inside_its_auth_string(self):
+        node = parse_share_link("hysteria2://user:secret@hk.example.net:8443#HK")
+        self.assertEqual(node["password"], "user:secret")
+
+    def test_alpn_is_read_for_protocols_other_than_vless(self):
+        node = parse_share_link("hysteria2://pw@hk.example.net:8443/?alpn=h3&sni=hk.example.net")
+        self.assertEqual(clash_outbound(node, "exit-hk")["tls"]["alpn"], ["h3"])
+
+    def test_an_unsupported_transport_is_refused_instead_of_silently_downgraded(self):
+        # It used to yield a plain-TCP outbound that passed every check and never connected.
+        for link in (
+            "vless://uuid-1@h.example.net:443?security=tls&type=grpc&serviceName=g",
+            "vless://uuid-1@h.example.net:443?security=tls&type=httpupgrade&path=%2Fu",
+        ):
+            with self.assertRaises(ValueError) as caught:
+                parse_share_link(link)
+            self.assertIn("not supported", str(caught.exception))
+
+    def test_supported_transports_still_parse(self):
+        self.assertEqual(parse_share_link(
+            "vless://uuid-1@h.example.net:443?security=tls&type=ws&path=%2Fws")["network"], "ws")
+        self.assertEqual(parse_share_link(
+            "trojan://pw@h.example.net:443?sni=h.example.net")["network"], "tcp")
+
+
+class ProxyProfileDescriptionTests(unittest.TestCase):
+    """The parsed view is what answers "it works in my other client"."""
+
+    def test_it_reports_the_switches_that_decide_whether_a_node_carries_ike(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "hysteria2://pw@hk.example.net:8443/?obfs=salamander"
+                     "&obfs-password=o&sni=hk.example.net&insecure=1"})
+        self.assertEqual(parsed["protocol"], "hysteria2")
+        self.assertEqual(parsed["obfs"], "salamander")
+        self.assertTrue(parsed["obfs_password_set"])
+        self.assertTrue(parsed["udp_capable"])
+        self.assertEqual(parsed["sni"], "hk.example.net")
+
+    def test_it_never_carries_a_secret_or_an_address(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "vless://uuid-secret@hk.example.net:443?security=reality"
+                     "&type=tcp&sni=www.microsoft.com&pbk=public-key&sid=abcd"})
+        blob = json.dumps(parsed)
+        for secret in ("uuid-secret", "hk.example.net", "public-key", "abcd", "443"):
+            self.assertNotIn(secret, blob)
+        self.assertTrue(parsed["reality"])
+
+    def test_a_link_it_cannot_read_reports_the_reason(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "vless://uuid-1@h.example.net:443?security=tls&type=grpc"})
+        self.assertIn("not supported", parsed["error"])
+
+
+class ExitReadinessHonestyTests(unittest.TestCase):
+    def test_a_singbox_that_refused_to_start_leaves_no_exit_marked_ready(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            desired = {"proxy": {"enabled": True,
+                                 "profiles": {"n": {"name": "HK", "type": "node",
+                                                    "value": "trojan://pw@hk.example.net:443"}},
+                                 "exits": {"hk": {"enabled": True, "profile_id": "n"}}},
+                       "lines": [{"id": "1", "country": "hk", "epdg": "e.example.net"}]}
+            with patch.object(Orchestrator, "apply_singbox",
+                              side_effect=RuntimeError("sing-box exited during startup")):
+                app.reconcile_proxy(desired)
+            published = json.loads((app.root / "proxy-status.json").read_text())
+        exit_state = published["exits"]["hk"]
+        # Publishing ready here sent the UDP test at a socket nobody was serving.
+        self.assertFalse(exit_state["ready"])
+        self.assertIn("sing-box exited", exit_state["error"])

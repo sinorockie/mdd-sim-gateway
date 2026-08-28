@@ -135,6 +135,12 @@ def b64_padded(value: str) -> str:
     return base64.b64decode(text + "=" * (-len(text) % 4)).decode("utf-8", errors="replace")
 
 
+# Transports this converter can actually render into a working outbound. A link naming
+# anything else (grpc, h2, httpupgrade, quic, splithttp) must be refused rather than
+# silently downgraded to plain TCP.
+SUPPORTED_LINK_TRANSPORTS = {"", "tcp", "ws", "xhttp"}
+
+
 def parse_share_link(url: str) -> dict:
     """Convert one protocol share link into the Clash-style node dict clash_outbound() takes.
 
@@ -178,7 +184,12 @@ def parse_share_link(url: str) -> dict:
     if not parsed.hostname or not parsed.port:
         raise ValueError("node link is missing a host or port")
     query = {key: value[0] for key, value in parse_qs(parsed.query).items()}
+    # Hysteria2 carries its whole auth string in userinfo, and that string is allowed to
+    # contain a colon ("user:pass"). Reading only .username silently truncated it, so the
+    # server rejected an authentication the operator had pasted correctly.
     userinfo = unquote(parsed.username or "")
+    if parsed.password is not None:
+        userinfo = userinfo + ":" + unquote(parsed.password)
     node = {"server": parsed.hostname, "port": parsed.port,
             "network": query.get("type") or query.get("network") or "tcp",
             "servername": query.get("sni") or query.get("peer") or query.get("host") or "",
@@ -192,8 +203,6 @@ def parse_share_link(url: str) -> dict:
             node["reality-opts"] = {"public-key": query.get("pbk") or query.get("publicKey") or "",
                                     "short-id": query.get("sid") or query.get("shortId") or ""}
             node["client-fingerprint"] = query.get("fp") or "chrome"
-        if query.get("alpn"):
-            node["alpn"] = [x for x in query["alpn"].split(",") if x]
         if node["network"] == "xhttp":
             try:
                 extra = json.loads(unquote(query.get("extra") or "{}"))
@@ -209,12 +218,31 @@ def parse_share_link(url: str) -> dict:
     elif scheme in ("hysteria2", "hy2"):
         # QUIC-based, so it has no stream transport to describe.
         node.update({"type": "hysteria2", "password": userinfo, "network": "tcp"})
+        # A server expecting salamander discards every unobfuscated packet without a word,
+        # so a link whose obfs parameters are dropped here produces an exit that looks
+        # configured and never carries a byte.
+        if query.get("obfs"):
+            node["obfs"] = query["obfs"]
+            node["obfs-password"] = unquote(
+                query.get("obfs-password") or query.get("obfs_password")
+                or query.get("obfsParam") or "")
     else:
         raise ValueError(f"unsupported node link scheme {scheme or text[:12]!r}")
+    # alpn belongs to the TLS layer every one of these protocols shares; it used to be read
+    # for VLESS only, which quietly dropped the h3 an hysteria2 node may require.
+    if query.get("alpn"):
+        node["alpn"] = [x for x in unquote(query["alpn"]).split(",") if x]
     if node["network"] == "ws":
         host = query.get("host")
         node["ws-opts"] = {"path": unquote(query.get("path") or "/"),
                            "headers": {"Host": host} if host else {}}
+    elif node["network"] not in SUPPORTED_LINK_TRANSPORTS:
+        # Anything else was previously dropped on the floor: the outbound came out as a
+        # plain TCP one, passed every check, and then never completed a handshake. Name the
+        # transport instead, so the operator knows the gateway cannot carry this node.
+        raise ValueError(
+            f"node transport {node['network']!r} is not supported for VoWiFi exits "
+            "(supported: tcp, ws, xhttp)")
     return node
 
 
@@ -2451,6 +2479,12 @@ class Orchestrator:
         except Exception as exc:
             for line in desired.get("lines") or []:
                 lines_status[str(line.get("id"))] = {"ready": False, "error": str(exc)}
+            # build_proxy_config marks an exit ready once its config renders; a sing-box that
+            # then refused to start leaves no listener behind it. Publishing those exits as
+            # ready sent the UDP test at a socket nobody was serving and blamed the node.
+            for country, state in exits_state.items():
+                if state.get("mode") != "direct" and state.get("ready"):
+                    exits_state[country] = {**state, "ready": False, "error": str(exc)}
         atomic_json(self.status_path, {"updated_at": int(time.time()), "enabled": True,
                                        "exits": exits_state, "lines": lines_status})
 

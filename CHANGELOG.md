@@ -4,6 +4,28 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- [Issue #27](https://github.com/MddIdd/mdd-sim-gateway/issues/27): pasted Hysteria2 and VLESS
+  nodes that other clients connect to could fail here with a generic "no healthy UDP-capable
+  node is ready". Share links now keep the parameters that were silently dropped — Hysteria2
+  obfuscation (`obfs`/`obfs-password`, without which the server discards every packet), an auth
+  string containing a colon, and `alpn` for protocols other than VLESS — and a link naming a
+  transport this gateway cannot render (grpc, httpupgrade, h2, quic) is refused by name instead
+  of being downgraded to a plain TCP outbound that never completes a handshake.
+
+- Country exit failures now say what actually went wrong: a disabled exit, a country-routing
+  master switch left off, and a host orchestrator that is not publishing status are reported
+  as themselves rather than as an unhealthy node pool. An exit whose sing-box refused to start
+  is no longer published as ready, and the node test surfaces what sing-box/Xray-core reported
+  instead of discarding it.
+
+### Added
+
+- Testing an individual node now returns a redacted summary of how the gateway parsed the
+  link — protocol, transport, TLS/Reality, SNI, ALPN, obfuscation and UDP capability, with no
+  address or secret — so a node that works in another client can be compared field by field.
+
 ### Changed
 
 - Public Issue triage now analyzes a new Issue only once, accepts reruns only from the maintainer,

@@ -128,17 +128,35 @@ def _write_private_json(path: Path, value: dict):
     path.chmod(0o600)
 
 
-def _wait_tcp(port: int, process: subprocess.Popen, timeout: float = 4.0):
+def _process_detail(process: subprocess.Popen | None, limit: int = 300) -> str:
+    """Whatever the test proxy printed before giving up, trimmed to one readable line."""
+    if not process or not process.stderr:
+        return ""
+    try:
+        text = process.stderr.read() or ""
+    except (OSError, ValueError):
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(lines[-3:])[:limit]
+
+
+def _wait_tcp(port: int, process: subprocess.Popen, timeout: float = 4.0, what: str = "proxy"):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise EgressError("temporary proxy process exited during startup")
+            # The reason the process printed is the whole diagnosis; discarding it left the
+            # operator with a generic failure for a node their other clients accept.
+            detail = _process_detail(process)
+            raise EgressError(f"{what} exited during startup"
+                              + (f": {detail}" if detail else ""))
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=.2):
                 return
         except OSError:
             time.sleep(.08)
-    raise EgressError("temporary proxy process did not become ready")
+    raise EgressError(f"{what} did not become ready")
 
 
 def _stop_process(process: subprocess.Popen | None):
@@ -152,6 +170,14 @@ def _stop_process(process: subprocess.Popen | None):
         process.wait()
 
 
+def _config_error(summary: str, completed) -> str:
+    """Attach the checker's own complaint; it names the field an operator must fix."""
+    text = ((completed.stderr or "") + "\n" + (completed.stdout or "")).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    detail = " | ".join(lines[-2:])[:300]
+    return f"{summary}: {detail}" if detail else summary
+
+
 def _orchestrator_module():
     path = Path(__file__).resolve().parents[2] / "host" / "mdd_orchestrator.py"
     spec = importlib.util.spec_from_file_location("mdd_proxy_test_orchestrator", path)
@@ -160,6 +186,49 @@ def _orchestrator_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def describe_proxy_profile(profile: dict) -> dict:
+    """Summarize how the gateway understood a pasted node, with no secret in the result.
+
+    "It works in my other client" is only answerable by showing what this gateway parsed:
+    a missing obfs or an SNI read from the wrong parameter is invisible otherwise. Server
+    host, ports, passwords, UUIDs and keys are deliberately absent — only whether they are
+    present, and the switches that decide whether the node can carry IKE at all.
+    """
+    kind = str(profile.get("type") or "").lower()
+    if kind == "socks5":
+        return {"protocol": "socks5", "udp_capable": True}
+    value = str(profile.get("value") or "").strip()
+    if not value:
+        return {"error": "node share link is empty"}
+    try:
+        helper = _orchestrator_module()
+        if value.startswith("{") or value.split("://", 1)[0].lower() in ("socks", "socks5"):
+            outbound = helper.parse_manual_outbound(value, "describe")
+            node = {}
+        else:
+            node = helper.parse_share_link(value)
+            outbound = helper.clash_outbound(node, "describe")
+    except (ValueError, EgressError) as exc:
+        return {"error": str(exc)}
+    tls = outbound.get("tls") or {}
+    summary = {
+        "protocol": str(outbound.get("type") or ""),
+        "transport": str(node.get("network") or "tcp") if node else "",
+        "tls": bool(tls.get("enabled")),
+        "sni": str(tls.get("server_name") or ""),
+        "alpn": list(tls.get("alpn") or []),
+        "skip_cert_verify": bool(tls.get("insecure")),
+        "reality": bool((tls.get("reality") or {}).get("enabled")),
+        "utls_fingerprint": str((tls.get("utls") or {}).get("fingerprint") or ""),
+        "obfs": str((outbound.get("obfs") or {}).get("type") or ""),
+        "obfs_password_set": bool((outbound.get("obfs") or {}).get("password")),
+        "flow": str(outbound.get("flow") or ""),
+        "udp_capable": helper.outbound_supports_udp(outbound),
+    }
+    return {key: value for key, value in summary.items() if value not in ("", [], False)} \
+        | {"udp_capable": summary["udp_capable"], "protocol": summary["protocol"]}
 
 
 def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
@@ -210,7 +279,7 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
         check = subprocess.run([singbox, "check", "-c", str(sing_path)], text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
         if check.returncode:
-            raise EgressError("node configuration is invalid")
+            raise EgressError(_config_error("node configuration is invalid", check))
         try:
             if xhttp:
                 xray = shutil.which(os.environ.get("MDD_XRAY_BIN", "xray"))
@@ -232,16 +301,25 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
                                         text=True, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, timeout=8)
                 if xcheck.returncode:
-                    raise EgressError("XHTTP node configuration is invalid")
+                    raise EgressError(
+                        _config_error("XHTTP node configuration is invalid", xcheck))
                 xray_process = subprocess.Popen([xray, "run", "-config", str(xray_path)],
                                                 stdout=subprocess.DEVNULL,
-                                                stderr=subprocess.DEVNULL)
-                _wait_tcp(bridge_port, xray_process)
+                                                stderr=subprocess.PIPE, text=True)
+                _wait_tcp(bridge_port, xray_process, what="Xray-core")
             sing_process = subprocess.Popen([singbox, "run", "-c", str(sing_path)],
                                             stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL)
-            _wait_tcp(local_port, sing_process)
-            return test_udp_proxy("127.0.0.1", local_port, timeout)
+                                            stderr=subprocess.PIPE, text=True)
+            _wait_tcp(local_port, sing_process, what="sing-box")
+            try:
+                return test_udp_proxy("127.0.0.1", local_port, timeout)
+            except EgressError as exc:
+                # The proxy is up but the node did not carry the probe. Whatever sing-box
+                # logged while trying (handshake refused, auth rejected, no activity) is
+                # the difference between "your node is wrong" and "we built it wrong".
+                _stop_process(sing_process)
+                detail = _process_detail(sing_process)
+                raise EgressError(f"{exc}" + (f" — {detail}" if detail else "")) from exc
         finally:
             _stop_process(sing_process)
             _stop_process(xray_process)
