@@ -65,11 +65,24 @@ jobs:
               issue_number: issueNumber,
               per_page: 100,
             });
+            const {data: recentByAuthor} = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              creator: issue.user.login,
+              state: 'all',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 20,
+            });
+            const relatedIssues = recentByAuthor.filter(candidate =>
+              !candidate.pull_request && candidate.number !== issueNumber
+            );
             fs.writeFileSync(
               '.github/codex/issue-context-raw.json',
               JSON.stringify({
                 issue,
                 comments,
+                related_issues: relatedIssues,
                 event: {
                   name: context.eventName,
                   action: context.payload.action || '',

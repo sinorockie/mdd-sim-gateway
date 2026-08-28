@@ -28,6 +28,14 @@ class IssueTriageTests(unittest.TestCase):
                 {"user": {"login": "person"}, "body": "api_key=demo-value"},
                 {"user": {"login": "github-actions[bot]"}, "body": issue_triage.MARKER},
             ],
+            "related_issues": [
+                {
+                    "number": 11,
+                    "title": "Same failure",
+                    "body": f"Device {long_number} failed at https://private.example/related",
+                    "state": "open",
+                }
+            ],
         }
 
         result = issue_triage.prepare_context(payload)
@@ -37,6 +45,7 @@ class IssueTriageTests(unittest.TestCase):
         self.assertNotIn("demo-secret-value", encoded)
         self.assertNotIn(long_number, encoded)
         self.assertEqual(len(result["comments"]), 1)
+        self.assertEqual(result["recent_issues_by_same_author"][0]["number"], 11)
 
     def test_render_disables_mentions_links_and_html_comments(self):
         long_number = "9" * 14
@@ -45,11 +54,14 @@ class IssueTriageTests(unittest.TestCase):
                 "category": "bug",
                 "priority": "high",
                 "confidence": "medium",
+                "disposition": "needs-logs",
                 "summary": (
                     "Ask @maintainer <!-- hidden --> at https://bad.example/ "
                     f"with token=another-demo-value and {long_number}"
                 ),
-                "analysis": "Likely a bounded failure.",
+                "confirmed_facts": ["The operation completed."],
+                "likely_causes": ["A named recovery stage may have failed."],
+                "related_issues": ["#11 may be a continuation."],
                 "missing_information": ["Provide redacted logs"],
                 "recommended_next_steps": ["Confirm the installed version"],
                 "needs_human": True,
@@ -65,6 +77,10 @@ class IssueTriageTests(unittest.TestCase):
         self.assertNotIn("hidden", comment)
         self.assertNotIn("another-demo-value", comment)
         self.assertNotIn(long_number, comment)
+        self.assertIn("处理状态：`needs-logs`", comment)
+        self.assertIn("### 已确认", comment)
+        self.assertIn("### 高概率原因", comment)
+        self.assertNotIn("### 初步判断", comment)
         selected = {label["name"] for label in labels["apply"]}
         self.assertIn("ai-needs-info", selected)
         self.assertIn("ai-needs-human", selected)
@@ -135,8 +151,11 @@ class IssueTriageTests(unittest.TestCase):
                 "category": "question",
                 "priority": "low",
                 "confidence": "low",
+                "disposition": "actionable",
                 "summary": "Summary",
-                "analysis": "Analysis",
+                "confirmed_facts": ["Fact"],
+                "likely_causes": ["Cause"],
+                "related_issues": [],
                 "missing_information": [],
                 "recommended_next_steps": [],
                 "needs_human": False,
@@ -163,8 +182,56 @@ class IssueTriageTests(unittest.TestCase):
                     "category": "close-immediately",
                     "priority": "low",
                     "confidence": "low",
+                    "disposition": "actionable",
                     "summary": "",
-                    "analysis": "",
+                    "confirmed_facts": [],
+                    "likely_causes": [],
+                    "related_issues": [],
+                    "missing_information": [],
+                    "recommended_next_steps": [],
+                    "needs_human": False,
+                    "human_reason": "",
+                }
+            )
+
+    def test_result_limits_actionable_sections(self):
+        result = issue_triage.validate_result(
+            {
+                "category": "bug",
+                "priority": "medium",
+                "confidence": "medium",
+                "disposition": "needs-logs",
+                "summary": "s" * 500,
+                "confirmed_facts": [f"fact-{index}-" + "x" * 400 for index in range(5)],
+                "likely_causes": [f"cause-{index}" for index in range(4)],
+                "related_issues": [f"#{index}" for index in range(4)],
+                "missing_information": [f"missing-{index}" for index in range(5)],
+                "recommended_next_steps": [f"step-{index}" for index in range(5)],
+                "needs_human": False,
+                "human_reason": "",
+            }
+        )
+
+        self.assertEqual(len(result["summary"]), 280)
+        self.assertEqual(len(result["confirmed_facts"]), 3)
+        self.assertLessEqual(len(result["confirmed_facts"][0]), 240)
+        self.assertEqual(len(result["likely_causes"]), 2)
+        self.assertEqual(len(result["related_issues"]), 2)
+        self.assertEqual(len(result["missing_information"]), 3)
+        self.assertEqual(len(result["recommended_next_steps"]), 3)
+
+    def test_invalid_disposition_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Invalid disposition"):
+            issue_triage.validate_result(
+                {
+                    "category": "bug",
+                    "priority": "medium",
+                    "confidence": "medium",
+                    "disposition": "write-an-essay",
+                    "summary": "Summary",
+                    "confirmed_facts": [],
+                    "likely_causes": [],
+                    "related_issues": [],
                     "missing_information": [],
                     "recommended_next_steps": [],
                     "needs_human": False,

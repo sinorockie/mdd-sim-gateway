@@ -6,6 +6,10 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Changed
 
+- Public Issue triage now separates confirmed evidence from at most two likely causes, includes
+  recent reports by the same author for duplicate detection, asks only for blocking information,
+  and publishes a shorter action-oriented maintainer handoff instead of a general system analysis.
+
 - Public Issue triage now analyzes a new Issue only once, accepts reruns only from the maintainer,
   caps each Issue at three attempts, preserves the last successful analysis when a later attempt
   fails, and manages only AI-prefixed labels so human decisions are never removed automatically.

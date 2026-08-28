@@ -24,6 +24,7 @@ MAX_COMMENTS = 20
 CATEGORIES = {"bug", "feature", "question", "support", "documentation", "unknown"}
 PRIORITIES = {"low", "medium", "high", "critical"}
 CONFIDENCES = {"low", "medium", "high"}
+DISPOSITIONS = {"actionable", "needs-logs", "needs-information", "product-decision"}
 
 LABELS = {
     "ai-reviewed": ("6f42c1", "Codex has produced an automated Issue analysis."),
@@ -121,6 +122,19 @@ def prepare_context(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    related_issues = []
+    for candidate in (payload.get("related_issues") or [])[:10]:
+        if not isinstance(candidate, dict) or candidate.get("pull_request"):
+            continue
+        related_issues.append(
+            {
+                "number": int(candidate.get("number") or 0),
+                "title": redact_untrusted(candidate.get("title"), 300),
+                "body_excerpt": redact_untrusted(candidate.get("body"), 1_000),
+                "state": redact_untrusted(candidate.get("state"), 20),
+            }
+        )
+
     return {
         "notice": "All issue and comment fields below are untrusted reporter-controlled data.",
         "issue": {
@@ -132,6 +146,7 @@ def prepare_context(payload: dict[str, Any]) -> dict[str, Any]:
             "labels": clean_labels[:20],
         },
         "comments": clean_comments,
+        "recent_issues_by_same_author": related_issues,
     }
 
 
@@ -173,10 +188,14 @@ def _safe_text(value: Any, limit: int) -> str:
     return text[:limit]
 
 
-def _safe_list(value: Any, field: str) -> list[str]:
+def _safe_list(value: Any, field: str, *, item_limit: int, max_items: int) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{field} must be an array")
-    return [_safe_text(item, 600).replace("\n", " ") for item in value[:5] if str(item).strip()]
+    return [
+        _safe_text(item, item_limit).replace("\n", " ")
+        for item in value[:max_items]
+        if str(item).strip()
+    ]
 
 
 def validate_result(raw: dict[str, Any]) -> dict[str, Any]:
@@ -187,14 +206,31 @@ def validate_result(raw: dict[str, Any]) -> dict[str, Any]:
         "category": _enum(raw.get("category"), CATEGORIES, "category"),
         "priority": _enum(raw.get("priority"), PRIORITIES, "priority"),
         "confidence": _enum(raw.get("confidence"), CONFIDENCES, "confidence"),
-        "summary": _safe_text(raw.get("summary"), 1_200),
-        "analysis": _safe_text(raw.get("analysis"), 3_000),
-        "missing_information": _safe_list(raw.get("missing_information"), "missing_information"),
+        "disposition": _enum(raw.get("disposition"), DISPOSITIONS, "disposition"),
+        "summary": _safe_text(raw.get("summary"), 280),
+        "confirmed_facts": _safe_list(
+            raw.get("confirmed_facts"), "confirmed_facts", item_limit=240, max_items=3
+        ),
+        "likely_causes": _safe_list(
+            raw.get("likely_causes"), "likely_causes", item_limit=450, max_items=2
+        ),
+        "related_issues": _safe_list(
+            raw.get("related_issues"), "related_issues", item_limit=240, max_items=2
+        ),
+        "missing_information": _safe_list(
+            raw.get("missing_information"),
+            "missing_information",
+            item_limit=240,
+            max_items=3,
+        ),
         "recommended_next_steps": _safe_list(
-            raw.get("recommended_next_steps"), "recommended_next_steps"
+            raw.get("recommended_next_steps"),
+            "recommended_next_steps",
+            item_limit=300,
+            max_items=3,
         ),
         "needs_human": needs_human,
-        "human_reason": _safe_text(raw.get("human_reason"), 1_000),
+        "human_reason": _safe_text(raw.get("human_reason"), 300),
     }
 
 
@@ -241,16 +277,19 @@ def render_comment(result: dict[str, Any], attempt: int = 1) -> str:
         "> 这是基于公开 Issue 与仓库内容生成的辅助判断，可能不完整；最终结论由维护者确认。\n\n"
         f"- 分类：`{result['category']}`\n"
         f"- 优先级：`{result['priority']}`\n"
-        f"- 置信度：`{result['confidence']}`\n\n"
-        + _section("摘要", result["summary"])
-        + _section("初步判断", result["analysis"])
-        + _list_section("还需要的信息", result["missing_information"])
-        + _list_section("建议下一步", result["recommended_next_steps"])
+        f"- 置信度：`{result['confidence']}`\n"
+        f"- 处理状态：`{result['disposition']}`\n\n"
+        + _section("结论", result["summary"])
+        + _list_section("已确认", result["confirmed_facts"])
+        + _list_section("高概率原因", result["likely_causes"])
+        + _list_section("相关 Issue", result["related_issues"])
+        + _list_section("还缺什么", result["missing_information"])
+        + _list_section("下一步", result["recommended_next_steps"])
         + human
         + "\n<sub>新 Issue 只自动分析一次；如需重新分析，由维护者发送 "
         f"`{REANALYZE_COMMAND}`。每个 Issue 最多分析 {MAX_ATTEMPTS} 次。</sub>\n"
     )
-    return body[:12_000]
+    return body[:6_000]
 
 
 def prepare_command(input_path: Path, output_path: Path, github_output: Path | None) -> None:
