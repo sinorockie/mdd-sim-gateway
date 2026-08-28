@@ -51,6 +51,20 @@ class ModemError(RuntimeError):
     pass
 
 
+def decode_bcd_iccid(data):
+    """Decode EF_ICCID swapped-nibble BCD; empty string when the bytes are not an ICCID."""
+    digits = []
+    for byte in data:
+        for nibble in (byte & 0x0F, byte >> 4):
+            if nibble == 0x0F:
+                continue
+            if nibble > 9:
+                return ""
+            digits.append(str(nibble))
+    value = "".join(digits)
+    return value if value.startswith("89") and 18 <= len(value) <= 20 else ""
+
+
 def logical_channel_metadata(channels, requested=3, status="ready", error=""):
     """Return stable, UI-safe resource metadata for one physical UICC."""
     values = [int(channel) for channel in channels]
@@ -189,6 +203,35 @@ class ModemCard:
                   (max(0, len(response) - 2), status), flush=True)
         return response
 
+    def _iccid_from_card(self):
+        """Read EF_ICCID over AT+CSIM — the card's own answer on the basic channel.
+
+        AT+CCID reports the baseband's cached SIM view, and an eSIM profile switch happens
+        over AT+CSIM behind the baseband's back: its REFRESH goes unserved in passthrough,
+        so the cache keeps the previous profile's ICCID indefinitely. The orchestrator
+        verifies a post-switch bridge rebuild against this identity, so publishing the
+        cache made every switch look stuck until the 45 s timeout (issue #26). Selecting
+        MF afterwards restores the basic-channel file state the baseband expects.
+        """
+        try:
+            for select in ("00A4080C022FE2", "00A40804022FE2"):
+                response = self.csim(bytes.fromhex(select))
+                if len(response) >= 2 and response[-2] in (0x90, 0x61):
+                    break
+            else:
+                return ""
+            response = self.csim(bytes.fromhex("00B000000A"))
+            if len(response) != 12 or response[-2:] != b"\x90\x00":
+                return ""
+            return decode_bcd_iccid(response[:10])
+        except ModemError:
+            return ""
+        finally:
+            try:
+                self.select_mf(0)
+            except ModemError:
+                pass
+
     def identity(self):
         """Read hardware IMEI and the currently inserted SIM ICCID while we own the AT port.
 
@@ -197,7 +240,6 @@ class ModemCard:
         racing another AT client against APDU traffic.
         """
         imei = ""
-        iccid = ""
         for command in ("AT+CGSN", "AT+GSN"):
             try:
                 match = IMEI_RE.search(self._at(command))
@@ -206,14 +248,16 @@ class ModemCard:
                     break
             except ModemError:
                 pass
-        for command in ("AT+CCID", "AT+ICCID"):
-            try:
-                match = ICCID_RE.search(self._at(command))
-                if match:
-                    iccid = match.group(1).decode("ascii")
-                    break
-            except ModemError:
-                pass
+        iccid = self._iccid_from_card()
+        if not iccid:
+            for command in ("AT+CCID", "AT+ICCID"):
+                try:
+                    match = ICCID_RE.search(self._at(command))
+                    if match:
+                        iccid = match.group(1).decode("ascii")
+                        break
+                except ModemError:
+                    pass
         return {"imei": imei, "iccid": iccid}
 
     def close_channel(self, channel):

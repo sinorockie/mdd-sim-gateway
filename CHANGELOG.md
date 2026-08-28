@@ -4,6 +4,20 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- [Issue #26](https://github.com/MddIdd/mdd-sim-gateway/issues/26): a physical-eSIM profile
+  switch could report failure — and leave the page and device state on the previous SIM —
+  even though the eUICC had already switched. The modem bridge published the baseband's
+  cached ICCID, so the post-switch rebuild verification timed out; it now reads EF_ICCID
+  from the card itself over AT+CSIM and only falls back to the cache. When the switch
+  succeeds but line recovery still fails, the API now reports the switch with the recovery
+  error instead of a plain failure, and the UI shows the new profile as active with a hint
+  to check its line. Native card readers now retry the post-switch identity probe through
+  the eUICC REFRESH window instead of keeping the old ICCID after a single failed read,
+  and they disable the old profile's line during the switch (restored on failure) so the
+  old and new SIM can no longer both show as enabled.
+
 ### Changed
 
 - Public Issue triage now analyzes a new Issue only once, accepts reruns only from the maintainer,

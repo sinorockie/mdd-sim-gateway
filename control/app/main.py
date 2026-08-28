@@ -2638,6 +2638,34 @@ def _esim_guard_engine(name: str):
         )
 
 
+async def _esim_probe_card(idx: int, *, expect_iccid: str | None = None, attempts: int = 1):
+    """Read the card, retrying through the eUICC REFRESH window a profile switch opens.
+
+    Right after `profile enable` the card resets itself; a single probe lands inside that
+    window often enough that the reader keeps showing the previous profile forever (the
+    remove/insert events REFRESH generates are deliberately ignored while lpa_busy is set,
+    so this probe is the only chance to observe the new identity). Retry until the read
+    succeeds — and, when the caller knows which ICCID must appear, until the card reports
+    it. The last successful read wins even if the expectation never matched: the card's
+    answer is the truth, however unexpected.
+    """
+    last_error: Exception | None = None
+    result = None
+    for attempt in range(max(1, int(attempts))):
+        if attempt:
+            await asyncio.sleep(ESIM_CARD_REFRESH_INTERVAL)
+        try:
+            result = await asyncio.to_thread(sim.read_card, idx)
+        except Exception as e:  # noqa
+            last_error = e
+            continue
+        if not expect_iccid or str(result.iccid or "") == str(expect_iccid):
+            return result
+    if result is not None:
+        return result
+    raise last_error if last_error else RuntimeError("card probe produced no result")
+
+
 async def _esim_refresh_card(
     name: str,
     idx: int,
@@ -2645,11 +2673,14 @@ async def _esim_refresh_card(
     *,
     auto_start: bool = True,
     broadcast: bool = True,
+    expect_iccid: str | None = None,
+    attempts: int = 1,
 ):
     """Re-probe USIM identity after profile enable/disable/download and broadcast."""
     info = hub.cards.get(name) or {"index": idx, "name": name, "present": True}
     try:
-        c = card_data if card_data is not None else await asyncio.to_thread(sim.read_card, idx)
+        c = card_data if card_data is not None else await _esim_probe_card(
+            idx, expect_iccid=expect_iccid, attempts=attempts)
         info.update(
             present=True, index=idx, name=name,
             iccid=c.iccid, imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
@@ -2733,6 +2764,32 @@ async def _esim_prepare_profile_switch(hardware_id: str) -> dict[str, dict]:
             await asyncio.to_thread(engine.stop, iid)
             await hub.drop_ami(iid)
     if previous:
+        egress.publish()
+    return previous
+
+
+async def _esim_prepare_reader_profile_switch(name: str) -> dict[str, dict]:
+    """Fail-close the line whose profile a native reader is switching away from.
+
+    The modem path disables every affected line before touching the eUICC; without the
+    same step here the old profile's line keeps `enabled` after a successful switch, so
+    the UI shows the old and new SIM as active at the same time and auto-start can try
+    to revive a line whose profile no longer answers. Only the saved intent flag is
+    touched — a running engine is still rejected by the LPA guard, and a failure path
+    restores the flag through `_esim_restore_profile_switch`.
+    """
+    entry = hub.cards.get(name) or {}
+    iid = str(entry.get("matched") or "")
+    if not iid:
+        inst = _match_instance_by_iccid(str(entry.get("iccid") or ""))
+        iid = str(inst["id"]) if inst else ""
+    inst = cfg.get_instance(iid) if iid else None
+    if not inst:
+        return {}
+    previous = {iid: {"enabled": bool(inst.get("enabled", True)), "running": False}}
+    if inst.get("enabled", True):
+        await asyncio.to_thread(cfg.upsert_instance, {"id": iid, "enabled": False})
+        hub.reset_health(iid)
         egress.publish()
     return previous
 
@@ -2865,6 +2922,7 @@ async def _esim_run(
     *,
     refresh: bool = False,
     keep_busy: bool = False,
+    refresh_expect_iccid: str | None = None,
 ):
     """Serialize an LPA call: engine gate + per-reader lock + lpa_busy + optional refresh."""
     await asyncio.to_thread(_esim_guard_engine, name)
@@ -2873,7 +2931,9 @@ async def _esim_run(
         try:
             result = await coro
             if refresh:
-                await _esim_refresh_card(name, idx)
+                await _esim_refresh_card(
+                    name, idx, expect_iccid=refresh_expect_iccid,
+                    attempts=ESIM_CARD_REFRESH_ATTEMPTS if refresh_expect_iccid else 1)
             return result
         except lpa.LpaError as e:
             raise HTTPException(400, e.user_message()) from e
@@ -6172,8 +6232,14 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
             se = await asyncio.to_thread(
                 _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
                 body.get("aid"), require=True)
-            await _esim_run(
-                name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")), refresh=True)
+            previous = await _esim_prepare_reader_profile_switch(name)
+            try:
+                await _esim_run(
+                    name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
+                    refresh=True, refresh_expect_iccid=iccid)
+            except Exception:
+                await _esim_restore_profile_switch(previous)
+                raise
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": hub.cards.get(name)}
@@ -6192,7 +6258,20 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 keep_busy=True)
             lpa_succeeded = True
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
-            recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
+            try:
+                recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
+            except Exception as exc:  # noqa
+                # The eUICC already switched — reporting plain failure here made the UI
+                # keep the old profile marked active while the card ran the new one, the
+                # exact "switched but nothing happened" report in issue #26. Lines stay
+                # fail-closed (the new profile's keys are not the old line's), so answer
+                # with the truth: switched, but recovery still needs attention.
+                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                log.warning("eSIM profile switched but line recovery failed "
+                            "reader=%s hardware=%s: %s", name, hardware_id, detail)
+                return {"ok": True, "iccid": iccid, "se_id": se["id"],
+                        "card": hub.cards.get(name),
+                        "recovery_error": str(detail) or "line recovery failed"}
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],

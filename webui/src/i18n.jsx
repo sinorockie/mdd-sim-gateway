@@ -251,6 +251,8 @@ const zh = {
   'Cached view from {time} — switching works from here; click Load for a live read.': '当前显示 {time} 读取的缓存数据，可直接切换启用；点「读取」获取实时信息。',
   'Switch to "{name}"? Running line {id} stops first; the line for the newly enabled profile starts again automatically.': '切换到「{name}」？将先停止正在运行的线路 {id}，切换完成后新启用号码对应的线路会自动启动。',
   'Switched to {name} — its line starts automatically': '已切换到 {name}，对应线路将自动启动',
+  'Switched to {name}, but its line could not start automatically: {error}': '已切换到 {name}，但对应线路未能自动启动：{error}',
+  'Profile switched — check the line for {name}': '号码已切换，请检查 {name} 对应的线路',
   'Upload QR image': '上传二维码图片', 'Reading QR…': '正在识别二维码…',
   'or paste / drop a QR screenshot into this dialog': '也可以直接把二维码截图粘贴或拖拽到本窗口',
   'No QR code found in the image.': '未在图片中找到二维码。',

@@ -541,7 +541,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
       if (lineRunning && matchedInst) {
         await api.stop(matchedInst.id)
       }
-      await api.esimEnable(p.iccid, target)
+      const res = await api.esimEnable(p.iccid, target)
       // Optimistic view: enabling implicitly disables the previously enabled profile. A
       // fresh read here would race the auto-provisioned line that re-grabs the reader.
       setSes((list) => list.map((s) => (s.id !== se.id ? s : {
@@ -552,11 +552,27 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
             : String(x.profileState || '').toLowerCase() === 'enabled' ? 'disabled' : x.profileState,
         })),
       })))
-      showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
+      if (res?.recovery_error) {
+        // The eUICC switched but the line did not come back on its own — say exactly
+        // that, so the user starts the line instead of retrying an already-done switch.
+        setErr(t('Switched to {name}, but its line could not start automatically: {error}', { name: title, error: res.recovery_error }))
+        showToast?.(t('Profile switched — check the line for {name}', { name: title }))
+      } else {
+        showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
+      }
       await refresh?.()
     } catch (e) {
       showToast?.(e.message)
       setErr(e.message)
+      // The request can fail after the card already switched; resync from the gateway's
+      // persisted view instead of leaving the stale optimistic-free state on screen.
+      api.esimChipCached(reader).then((r) => {
+        if (r?.cached) {
+          setSes(r.ses || [])
+          setCachedAt((r.ts || 0) * 1000)
+          setLoaded(false)
+        }
+      }).catch(() => {})
     }
     setBusyOp('')
   }
