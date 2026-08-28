@@ -438,6 +438,7 @@ export function EgressPage({ showToast }) {
     if (parsed.flow) parts.push(`flow=${parsed.flow}`)
     if (parsed.skip_cert_verify) parts.push('insecure')
     parts.push(parsed.udp_capable ? 'UDP ✓' : 'UDP ✗')
+    if (parsed.engine) parts.push(parsed.engine)
     return parts.filter(Boolean).join(' · ')
   }
   const addExit = () => { if (!newCountry) return; patchExit(newCountry, { enabled: true, profile_id: '', keywords: countryKeywords(newCountry) }); setNewCountry('') }

@@ -226,9 +226,12 @@ def describe_proxy_profile(profile: dict) -> dict:
         "obfs_password_set": bool((outbound.get("obfs") or {}).get("password")),
         "flow": str(outbound.get("flow") or ""),
         "udp_capable": helper.outbound_supports_udp(outbound),
+        # Which engine actually carries this node — the answer to "my other client works".
+        "engine": "xray" if node and helper.node_needs_xray(node) else "sing-box",
     }
     return {key: value for key, value in summary.items() if value not in ("", [], False)} \
-        | {"udp_capable": summary["udp_capable"], "protocol": summary["protocol"]}
+        | {"udp_capable": summary["udp_capable"], "protocol": summary["protocol"],
+           "engine": summary["engine"]}
 
 
 def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
@@ -252,9 +255,11 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
         raise EgressError("sing-box executable not found")
     helper = _orchestrator_module()
     node = helper.parse_share_link(value) if value.lower().startswith("vless://") else None
-    xhttp = bool(node and str(node.get("network") or "").lower() == "xhttp")
+    # REALITY and XHTTP are Xray protocols; testing them through sing-box measured sing-box's
+    # compatibility with the server's Xray build rather than whether the node works.
+    via_xray = bool(node and helper.node_needs_xray(node))
     local_port, bridge_port = _free_loopback_port(), _free_loopback_port()
-    if xhttp:
+    if via_xray:
         outbound = {"type": "socks", "tag": "test-out", "version": "5",
                     "server": "127.0.0.1", "server_port": bridge_port}
     else:
@@ -281,17 +286,17 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
         if check.returncode:
             raise EgressError(_config_error("node configuration is invalid", check))
         try:
-            if xhttp:
+            if via_xray:
                 xray = shutil.which(os.environ.get("MDD_XRAY_BIN", "xray"))
                 if not xray:
-                    raise EgressError("Xray-core executable not found for XHTTP node")
+                    raise EgressError("Xray-core executable not found for this node")
                 xray_config = {
                     "log": {"loglevel": "warning"},
                     "inbounds": [{"listen": "127.0.0.1", "port": bridge_port,
                                   "protocol": "socks", "tag": "test-in",
                                   "settings": {"auth": "noauth", "udp": True,
                                                "ip": "127.0.0.1"}}],
-                    "outbounds": [helper.xray_xhttp_outbound(node, "test-out")],
+                    "outbounds": [helper.xray_outbound(node, "test-out")],
                     "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field",
                                 "inboundTag": ["test-in"], "outboundTag": "test-out"}]},
                 }
@@ -302,7 +307,7 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
                                         stderr=subprocess.PIPE, timeout=8)
                 if xcheck.returncode:
                     raise EgressError(
-                        _config_error("XHTTP node configuration is invalid", xcheck))
+                        _config_error("Xray node configuration is invalid", xcheck))
                 xray_process = subprocess.Popen([xray, "run", "-config", str(xray_path)],
                                                 stdout=subprocess.DEVNULL,
                                                 stderr=subprocess.PIPE, text=True)

@@ -201,7 +201,8 @@ def parse_share_link(url: str) -> dict:
                      in ("tls", "reality", "xtls")})
         if str(query.get("security") or "").lower() == "reality":
             node["reality-opts"] = {"public-key": query.get("pbk") or query.get("publicKey") or "",
-                                    "short-id": query.get("sid") or query.get("shortId") or ""}
+                                    "short-id": query.get("sid") or query.get("shortId") or "",
+                                    "spider-x": unquote(query.get("spx") or "")}
             node["client-fingerprint"] = query.get("fp") or "chrome"
         if node["network"] == "xhttp":
             try:
@@ -362,35 +363,73 @@ def clash_node_supports_udp(node: dict) -> bool:
     return network in {"", "tcp", "ws", "xhttp"}
 
 
-def xray_xhttp_outbound(node: dict, tag: str) -> dict:
-    """Convert a VLESS XHTTP node to Xray-core's native outbound form."""
-    if str(node.get("type") or "").lower() != "vless" \
-            or str(node.get("network") or "").lower() != "xhttp":
-        raise ValueError("XHTTP currently requires a VLESS node")
+def node_needs_xray(node: dict) -> bool:
+    """True when this node is better served by Xray-core than by sing-box.
+
+    REALITY is an Xray protocol and its wire details move with Xray. When a server runs a
+    build newer than the one sing-box's implementation targets, sing-box fails the handshake
+    with "reality verification failed" while Xray clients on the same server connect — a
+    difference that reads to an operator as a broken gateway. Handing REALITY to the engine
+    that defines it removes a whole class of version skew; XHTTP already went this way.
+    """
+    if str(node.get("type") or "").lower() != "vless":
+        return False
+    if str(node.get("network") or "").lower() == "xhttp":
+        return True
+    return bool((node.get("reality-opts") or {}).get("public-key"))
+
+
+def xray_outbound(node: dict, tag: str) -> dict:
+    """Convert a VLESS node to Xray-core's native outbound form (raw/ws/xhttp)."""
+    if str(node.get("type") or "").lower() != "vless":
+        raise ValueError("the Xray path currently requires a VLESS node")
+    network = str(node.get("network") or "tcp").lower() or "tcp"
     reality = node.get("reality-opts") or {}
-    if not reality.get("public-key"):
+    if network == "xhttp" and not reality.get("public-key"):
         raise ValueError("Reality XHTTP node is missing its public key (pbk)")
     user = {"id": str(node.get("uuid") or ""), "encryption": "none",
             "flow": str(node.get("flow") or "")}
     if node.get("packet-encoding"):
         user["packetEncoding"] = str(node["packet-encoding"])
-    xhttp = node.get("xhttp-opts") or {}
-    stream = {"network": "xhttp", "security": "reality",
-              "realitySettings": {
-                  "serverName": node.get("servername") or node.get("server"),
-                  "fingerprint": node.get("client-fingerprint") or "chrome",
-                  "publicKey": reality.get("public-key"),
-                  "shortId": reality.get("short-id") or "",
-              },
-              "xhttpSettings": {"host": xhttp.get("host") or "",
-                                "path": xhttp.get("path") or "/",
-                                "mode": xhttp.get("mode") or "auto"}}
-    if isinstance(xhttp.get("extra"), dict) and xhttp["extra"]:
-        stream["xhttpSettings"]["extra"] = xhttp["extra"]
+    server_name = node.get("servername") or node.get("server")
+    fingerprint = str(node.get("client-fingerprint") or "") or "chrome"
+    # Xray names the plain TCP transport "raw"; "tcp" remains accepted as its alias.
+    stream = {"network": "raw" if network == "tcp" else network}
+    if reality.get("public-key"):
+        stream["security"] = "reality"
+        stream["realitySettings"] = {
+            "serverName": server_name,
+            "fingerprint": fingerprint,
+            "publicKey": reality.get("public-key"),
+            "shortId": reality.get("short-id") or "",
+        }
+        if reality.get("spider-x"):
+            stream["realitySettings"]["spiderX"] = str(reality["spider-x"])
+    elif node.get("tls"):
+        stream["security"] = "tls"
+        stream["tlsSettings"] = {"serverName": server_name,
+                                 "allowInsecure": bool(node.get("skip-cert-verify", False)),
+                                 "fingerprint": fingerprint}
+        if node.get("alpn"):
+            stream["tlsSettings"]["alpn"] = list(node["alpn"])
+    else:
+        stream["security"] = "none"
+    if network == "xhttp":
+        xhttp = node.get("xhttp-opts") or {}
+        stream["xhttpSettings"] = {"host": xhttp.get("host") or "",
+                                   "path": xhttp.get("path") or "/",
+                                   "mode": xhttp.get("mode") or "auto"}
+        if isinstance(xhttp.get("extra"), dict) and xhttp["extra"]:
+            stream["xhttpSettings"]["extra"] = xhttp["extra"]
+    elif network == "ws":
+        ws = node.get("ws-opts") or {}
+        stream["wsSettings"] = {"path": ws.get("path") or "/",
+                                "headers": ws.get("headers") or {}}
     return {"protocol": "vless", "tag": tag,
             "settings": {"vnext": [{"address": node.get("server"),
                                      "port": int(node.get("port") or 0), "users": [user]}]},
             "streamSettings": stream}
+
 
 
 def outbound_supports_udp(outbound: dict) -> bool:
@@ -1772,8 +1811,8 @@ class Orchestrator:
             raise RuntimeError("PyYAML is required for subscription mode")
         return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
 
-    def xhttp_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
-        """Register one loopback-only Xray XHTTP endpoint and return its sing-box detour."""
+    def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
+        """Register one loopback-only Xray endpoint and return its sing-box detour."""
         if runtime_id not in self._xray_ports:
             # Stable allocation with collision probing. Ports never leave loopback.
             port = 24000 + int(hashlib.sha256(runtime_id.encode()).hexdigest()[:6], 16) % 1000
@@ -1786,15 +1825,15 @@ class Orchestrator:
                                         "protocol": "socks", "tag": inbound_tag,
                                         "settings": {"auth": "noauth", "udp": True,
                                                      "ip": "127.0.0.1"}})
-            self._xray_outbounds.append(xray_xhttp_outbound(node, outbound_tag))
+            self._xray_outbounds.append(xray_outbound(node, outbound_tag))
             self._xray_rules.append({"type": "field", "inboundTag": [inbound_tag],
                                      "outboundTag": outbound_tag})
         return {"type": "socks", "tag": sing_tag, "version": "5",
                 "server": "127.0.0.1", "server_port": self._xray_ports[runtime_id]}
 
     def node_outbound(self, node: dict, tag: str, runtime_id: str) -> dict:
-        if str(node.get("network") or "").lower() == "xhttp":
-            return self.xhttp_bridge_outbound(node, tag, runtime_id)
+        if node_needs_xray(node):
+            return self.xray_bridge_outbound(node, tag, runtime_id)
         return clash_outbound(node, tag)
 
     def build_proxy_config(self, proxy: dict) -> tuple[dict, dict]:

@@ -20,10 +20,20 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   is no longer published as ready, and the node test surfaces what sing-box/Xray-core reported
   instead of discarding it.
 
+### Changed
+
+- VLESS REALITY nodes now run on the bundled Xray-core instead of sing-box, over the same
+  loopback bridge XHTTP already used. REALITY's wire details move with Xray, so a server on a
+  newer Xray build could answer Xray clients while sing-box failed the handshake with
+  "reality verification failed" — a version skew the gateway no longer sits in the middle of.
+  Nodes sing-box handles correctly are untouched. The pinned Xray version stays on the newest
+  release upstream marks stable; `MDD_XRAY_VERSION` may now be overridden together with
+  `MDD_XRAY_SHA256_AMD64`/`_ARM64` for an operator who must match a prerelease server.
+
 ### Added
 
 - Testing an individual node now returns a redacted summary of how the gateway parsed the
-  link — protocol, transport, TLS/Reality, SNI, ALPN, obfuscation and UDP capability, with no
+  link — protocol, transport, TLS/Reality, SNI, ALPN, obfuscation, UDP capability and which engine carries it, with no
   address or secret — so a node that works in another client can be compared field by field.
 
 ### Changed

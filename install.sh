@@ -117,9 +117,13 @@ VPCD_SLOTS="${VPCD_SLOTS:-4}"
 SINGBOX_VERSION="${MDD_SINGBOX_VERSION:-1.13.15}"
 SINGBOX_SHA256_AMD64="a3a3ff223b23c3f4731d0a17cb0ef94c97ce257c70721a5b07dc7ca079203c9f"
 SINGBOX_SHA256_ARM64="f0810bbb5722ae36635687c421019defcc8b328d31a0b3c287901f331747ca93"
+# 26.3.27 is the newest release Xray marks stable; everything after it is a prerelease.
+# REALITY moves with Xray, so an operator whose server runs a prerelease may need to match
+# it here. Overriding the version alone would only fail the checksum of the pinned one, so
+# the digests are overridable together with it — a reviewed override, never a silent one.
 XRAY_VERSION="${MDD_XRAY_VERSION:-26.3.27}"
-XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
+XRAY_SHA256_AMD64="${MDD_XRAY_SHA256_AMD64:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}"
+XRAY_SHA256_ARM64="${MDD_XRAY_SHA256_ARM64:-4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c}"
 LPAC_VERSION="${MDD_LPAC_VERSION:-2.3.0}"
 LPAC_COMMIT="c2fcf5e4b21c712d54e35a11da2ad9ad134fb821"
 CMAKE_SHA256_AMD64="0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c"

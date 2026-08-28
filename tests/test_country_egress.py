@@ -8,8 +8,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from control.app import egress
-from host.mdd_orchestrator import (Orchestrator, clash_outbound, parse_manual_outbound,
-                                   parse_proxy_url, parse_share_link, xray_xhttp_outbound)
+from host.mdd_orchestrator import (Orchestrator, clash_outbound, node_needs_xray,
+                                   parse_manual_outbound, parse_proxy_url, parse_share_link,
+                                   xray_outbound)
 
 
 class CountryEgressTests(unittest.TestCase):
@@ -141,7 +142,7 @@ class PastedNodeTests(unittest.TestCase):
             "vless://uuid-2@xhttp.example.net:443?security=reality&type=xhttp"
             "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123"
             "&host=cdn.example.net&path=%2Fupdates&mode=packet-up&packetEncoding=xudp")
-        outbound = xray_xhttp_outbound(node, "out-one")
+        outbound = xray_outbound(node, "out-one")
         stream = outbound["streamSettings"]
         self.assertEqual(stream["network"], "xhttp")
         self.assertEqual(stream["realitySettings"]["publicKey"], "public-key")
@@ -944,3 +945,65 @@ class ExitReadinessHonestyTests(unittest.TestCase):
         # Publishing ready here sent the UDP test at a socket nobody was serving.
         self.assertFalse(exit_state["ready"])
         self.assertIn("sing-box exited", exit_state["error"])
+
+
+class RealityRunsOnXrayTests(unittest.TestCase):
+    """REALITY is an Xray protocol, so Xray is what must speak it.
+
+    Issue #27: a server on a newer Xray build answered Xray clients and failed sing-box with
+    "reality verification failed". Routing REALITY through the Xray already installed for
+    XHTTP removes that version skew instead of chasing it.
+    """
+
+    REALITY_LINK = ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+                    "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=abcd"
+                    "&spx=%2F&flow=xtls-rprx-vision")
+
+    def test_reality_and_xhttp_pick_xray_while_plain_tls_stays_on_singbox(self):
+        self.assertTrue(node_needs_xray(parse_share_link(self.REALITY_LINK)))
+        self.assertTrue(node_needs_xray(parse_share_link(
+            "vless://uuid-2@x.example.net:443?security=reality&type=xhttp"
+            "&sni=www.microsoft.com&pbk=public-key&sid=abcd")))
+        # A node sing-box handles correctly must not be moved off it.
+        self.assertFalse(node_needs_xray(parse_share_link(
+            "vless://uuid-3@t.example.net:443?security=tls&type=ws&path=%2Fws")))
+        self.assertFalse(node_needs_xray(parse_share_link(
+            "trojan://pw@t.example.net:443?sni=t.example.net")))
+
+    def test_vision_reality_over_raw_tcp_converts_for_xray(self):
+        outbound = xray_outbound(parse_share_link(self.REALITY_LINK), "out-one")
+        stream = outbound["streamSettings"]
+        # Xray calls the plain TCP transport "raw".
+        self.assertEqual(stream["network"], "raw")
+        self.assertEqual(stream["security"], "reality")
+        self.assertEqual(stream["realitySettings"]["publicKey"], "public-key")
+        self.assertEqual(stream["realitySettings"]["shortId"], "abcd")
+        self.assertEqual(stream["realitySettings"]["serverName"], "www.microsoft.com")
+        self.assertEqual(stream["realitySettings"]["spiderX"], "/")
+        self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["flow"],
+                         "xtls-rprx-vision")
+
+    def test_a_reality_exit_is_built_as_a_loopback_bridge_to_xray(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            config, states = app.build_proxy_config({
+                "profiles": {"node-one": {"name": "UK Reality", "type": "node",
+                                          "value": self.REALITY_LINK}},
+                "exits": {"gb": {"enabled": True, "profile_id": "node-one"}},
+            })
+        self.assertTrue(states["gb"]["ready"])
+        exit_outbound = next(x for x in config["outbounds"] if x.get("tag") == "exit-gb")
+        # sing-box only carries it to the local Xray; the node itself is Xray's business.
+        self.assertEqual(exit_outbound["type"], "socks")
+        self.assertEqual(exit_outbound["server"], "127.0.0.1")
+        self.assertTrue(app.next_xray_config)
+        xray_out = app.next_xray_config["outbounds"][0]
+        self.assertEqual(xray_out["protocol"], "vless")
+        self.assertEqual(xray_out["streamSettings"]["security"], "reality")
+
+    def test_the_node_test_reports_which_engine_carries_it(self):
+        parsed = egress.describe_proxy_profile({"type": "node", "value": self.REALITY_LINK})
+        self.assertEqual(parsed["engine"], "xray")
+        self.assertTrue(parsed["reality"])
+        self.assertEqual(egress.describe_proxy_profile(
+            {"type": "node", "value": "trojan://pw@t.example.net:443"})["engine"], "sing-box")
